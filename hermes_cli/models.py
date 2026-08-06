@@ -4163,7 +4163,8 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
     - GPT-5 / Codex models on Zen use ``/v1/responses``
     - Claude models on Zen use ``/v1/messages``
     - MiniMax and Qwen models on Go use ``/v1/messages``
-    - GLM / Kimi / DeepSeek / MiMo on Go use ``/v1/chat/completions``
+    - GLM / Kimi / MiMo and DeepSeek Pro on Go use ``/v1/chat/completions``
+    - DeepSeek V4 Flash on Go uses ``/v1/responses``
     - Qwen models on Zen use ``/v1/messages``
     - Other Zen models (Gemini, GLM, Kimi, MiniMax, DeepSeek, etc.) use
       ``/v1/chat/completions``
@@ -4183,6 +4184,11 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
             # All Qwen models on Go (qwen3.7-max, qwen3.7-plus, qwen3.6-plus)
             # are served via /v1/messages per the published Go endpoint table.
             return "anthropic_messages"
+        if normalized == "deepseek-v4-flash":
+            # OpenCode Go's DeepSeek V4 Flash endpoint natively supports the
+            # Responses API. Keep DeepSeek Pro and other Go models on their
+            # documented transports below.
+            return "codex_responses"
         return "chat_completions"
 
     if provider == "opencode-zen":

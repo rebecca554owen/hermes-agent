@@ -262,9 +262,11 @@ class TestCopilotNormalization:
         # All Qwen models on Go route via /v1/messages (Go endpoint table).
         assert opencode_model_api_mode("opencode-go", "qwen3.7-plus") == "anthropic_messages"
         assert opencode_model_api_mode("opencode-go", "qwen3.6-plus") == "anthropic_messages"
-        # DeepSeek / MiMo on Go are OpenAI-compatible chat completions.
+        # DeepSeek Pro / MiMo on Go are OpenAI-compatible chat completions;
+        # DeepSeek V4 Flash is served by the native Responses endpoint.
         assert opencode_model_api_mode("opencode-go", "deepseek-v4-pro") == "chat_completions"
-        assert opencode_model_api_mode("opencode-go", "deepseek-v4-flash") == "chat_completions"
+        assert opencode_model_api_mode("opencode-go", "deepseek-v4-flash") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "opencode-go/deepseek-v4-flash") == "codex_responses"
         assert opencode_model_api_mode("opencode-go", "mimo-v2.5") == "chat_completions"
         assert opencode_model_api_mode("opencode-go", "kimi-k2.7-code") == "chat_completions"
         assert opencode_model_api_mode("opencode-go", "glm-5.2") == "chat_completions"
@@ -518,5 +520,4 @@ class TestProbeApiModelsUserAgent:
         assert ua and ua.startswith("hermes-cli/")
         # No Authorization was set, but UA must still be present.
         assert req.get_header("Authorization") is None
-
 
