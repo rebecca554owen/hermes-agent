@@ -41,9 +41,8 @@ from agent.model_metadata import (
 )
 from agent.redact import redact_sensitive_text
 from agent.responses_compaction import (
-    compaction_item_to_sidecar,
+    build_compaction_sidecar,
     route_for_request,
-    wrap_summary_as_compaction_item,
 )
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
@@ -6232,12 +6231,20 @@ This compaction should PRIORITISE preserving all information related to the focu
     ) -> None:
         """Attach the wrapped local summary as a Responses compaction sidecar.
 
-        Bridge gate: only when ``compression_remote`` is not ``"off"`` AND the
-        summary was genuinely generated. The deterministic failure/feasibility
-        fallback never mounts — it carries no recovered information worth
-        checkpointing. Both the off and fallback paths leave ``compressed``
-        untouched, so remote=off stays byte-identical to the pre-bridge
-        compressor.
+        Bridge gate: only when ``compression_remote`` is not the off value AND
+        the summary was genuinely generated. The deterministic
+        failure/feasibility fallback never mounts — it carries no recovered
+        information worth checkpointing. Both the off and fallback paths leave
+        ``compressed`` untouched, so remote=off stays byte-identical to the
+        pre-bridge compressor.
+
+        The sidecar mirrors the provider-minted shape: the compaction
+        checkpoint item followed by an assistant message item carrying the
+        summary text. The adapter replay branch replaces the boundary message
+        content with these items, so the message item is what keeps the
+        summary visible in the API projection. A wrap failure never breaks
+        ``compress()`` — the sidecar is an optimization, so any exception
+        skips the mount and leaves the plain transcript.
         """
         if self.compression_remote == "off":
             return
@@ -6251,15 +6258,23 @@ This compaction should PRIORITISE preserving all information related to the focu
             endpoint=str(self.base_url or ""),
             model=str(self.model or ""),
         )
-        item = wrap_summary_as_compaction_item(
-            summary_text,
-            route,
-            max_item_chars=self.compression_remote_max_item_chars,
-            token_savings_est=token_savings_est,
-        )
-        compressed[mount_idx]["codex_output_items"] = [
-            compaction_item_to_sidecar(item, route)
-        ]
+        try:
+            compressed[mount_idx]["codex_output_items"] = build_compaction_sidecar(
+                summary_text,
+                route,
+                max_item_chars=self.compression_remote_max_item_chars,
+                token_savings_est=token_savings_est,
+            )
+        except Exception as exc:
+            # The bridge sidecar is a zero-cost optimization, never a
+            # correctness dependency: an un-wrappable summary (e.g. an
+            # envelope that cannot fit any content under the cap) must not
+            # fail or alter the compression result.
+            logger.debug(
+                "compaction sidecar mount skipped (%s: %s)",
+                type(exc).__name__,
+                exc,
+            )
 
     def compress(
         self,

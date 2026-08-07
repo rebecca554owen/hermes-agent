@@ -14,7 +14,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 COMPACTION_LEDGER_VERSION = 3
@@ -1824,3 +1824,43 @@ def compaction_item_to_sidecar(
     sidecar["_issuer_kind"] = route.issuer_kind
     sidecar["_compaction_route"] = route.to_dict()
     return sidecar
+
+
+def build_compaction_sidecar(
+    summary_text: str,
+    route: NativeCompactionRoute,
+    *,
+    max_item_chars: int = 12000,
+    created_at: Optional[float] = None,
+    token_savings_est: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Build the two-item Responses compaction sidecar for a local summary.
+
+    Mirrors the provider-minted sidecar shape — a compaction checkpoint item
+    followed by the assistant message carrying the summary text — so the
+    responses adapter replay branch keeps the summary visible in the API
+    projection (``items = candidate`` replaces the boundary message content
+    with the sidecar items). The message item carries the *effective*
+    (envelope-capped) summary text, never the raw input, so what the model
+    sees matches exactly what the checkpoint sealed. Both items are stamped
+    with the route fences ``compaction_item_to_sidecar`` requires; raising
+    ``ValueError`` when the summary cannot be wrapped at all (e.g. an
+    un-cappable envelope) so callers can skip the mount.
+    """
+    item = wrap_summary_as_compaction_item(
+        summary_text,
+        route,
+        max_item_chars=max_item_chars,
+        created_at=created_at,
+        token_savings_est=token_savings_est,
+    )
+    effective_text = unwrap_compaction_item(item)["summary_text"]
+    message_item: Dict[str, Any] = {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": effective_text}],
+    }
+    return [
+        compaction_item_to_sidecar(item, route),
+        compaction_item_to_sidecar(message_item, route),
+    ]

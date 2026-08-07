@@ -18,6 +18,8 @@ gate driven by ``compression.remote`` (auto/on/off).
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import time
+
 import pytest
 
 from agent.codex_responses_adapter import (
@@ -40,6 +42,7 @@ from agent.responses_compaction import (
     NativeCompactionRoute,
     NativeCompactionStateError,
     _BRIDGE_ENVELOPE_VERSION,
+    build_compaction_sidecar,
     build_native_request_overrides,
     compaction_checkpoint_digest,
     compaction_item_to_sidecar,
@@ -656,9 +659,11 @@ def test_compress_attaches_sidecar_when_remote_enabled():
     assert boundary["role"] == "assistant"
     assert boundary.get(COMPRESSED_SUMMARY_METADATA_KEY)
 
-    # The sidecar is the wrapped, route-stamped compaction item.
+    # The sidecar mirrors the provider-minted two-item shape: the wrapped,
+    # route-stamped compaction checkpoint item followed by an assistant
+    # message item carrying the summary text (GAP-B).
     sidecar = boundary["codex_output_items"]
-    assert len(sidecar) == 1
+    assert len(sidecar) == 2
     item = sidecar[0]
     expected_route = route_for_request(
         provider="opencode-go",
@@ -674,8 +679,22 @@ def test_compress_attaches_sidecar_when_remote_enabled():
     assert "rolled-up middle summary" in payload["summary_text"]
     assert payload["route"] == expected_route.to_dict()
 
+    # The second sidecar item is the assistant message carrying the same
+    # (envelope-capped) summary text — the piece the replay projection
+    # actually shows the model.
+    message_item = sidecar[1]
+    assert message_item["type"] == "message"
+    assert message_item["role"] == "assistant"
+    assert message_item["content"] == [
+        {"type": "output_text", "text": payload["summary_text"]}
+    ]
+    assert message_item["_issuer_kind"] == expected_route.issuer_kind
+    assert message_item["_compaction_route"] == expected_route.to_dict()
+
     # End to end: the responses adapter accepts the mounted sidecar as the
-    # new request prefix and the live tail survives the projection.
+    # new request prefix — the summary text stays visible in the API
+    # projection as the post-compaction assistant message — and the live
+    # tail survives the projection.
     items = _chat_messages_to_responses_input(
         result,
         current_issuer_kind=expected_route.issuer_kind,
@@ -683,6 +702,9 @@ def test_compress_attaches_sidecar_when_remote_enabled():
     )
     assert items[0]["type"] == "compaction"
     assert items[0]["encrypted_content"].startswith(BRIDGE_ENVELOPE_PREFIX)
+    assert items[1]["type"] == "message"
+    assert items[1]["role"] == "assistant"
+    assert "rolled-up middle summary" in items[1]["content"][0]["text"]
     assert "the visible question" in str([i.get("content") for i in items])
 
 
@@ -719,4 +741,90 @@ def test_compress_fallback_never_mounts_sidecar():
         result = c.compress(_bridge_transcript(), current_tokens=90_000)
     assert c._last_summary_fallback_used is True
     assert all("codex_output_items" not in m for m in result)
+
+
+def test_sidecar_carries_summary_message_item():
+    """GAP-B: the bridge sidecar is the two-item provider shape — compaction
+    checkpoint plus an assistant message item carrying the summary text — so
+    the adapter replay projection keeps the summary visible to the model."""
+    route = _local_route()
+    sidecar = build_compaction_sidecar("checkpoint body", route)
+    assert [item["type"] for item in sidecar] == ["compaction", "message"]
+    compaction_item, message_item = sidecar
+    # Both items carry the route fences the replay branch demands.
+    for stamped in sidecar:
+        assert stamped["_issuer_kind"] == route.issuer_kind
+        assert stamped["_compaction_route"] == route.to_dict()
+    assert compaction_item["encrypted_content"].startswith(BRIDGE_ENVELOPE_PREFIX)
+    assert message_item["role"] == "assistant"
+    assert message_item["content"] == [
+        {"type": "output_text", "text": "checkpoint body"}
+    ]
+    # The message item passes the adapter preflight (content list, assistant
+    # role) and the summary text survives the replay projection verbatim.
+    items = _chat_messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "carrier",
+                "codex_output_items": sidecar,
+            },
+            {"role": "user", "content": "live tail"},
+        ],
+        current_issuer_kind=route.issuer_kind,
+        current_compaction_route=route.to_dict(),
+    )
+    assert [item.get("type") for item in items[:2]] == ["compaction", "message"]
+    assert items[1]["role"] == "assistant"
+    assert items[1]["content"][0]["text"] == "checkpoint body"
+    assert items[2] == {"role": "user", "content": "live tail"}
+
+
+def test_compress_wrap_failure_skips_sidecar():
+    """GAP-C: a wrap failure (e.g. a summary that cannot fit the envelope cap)
+    must not break compress() — the sidecar mount degrades to a no-op and the
+    plain transcript is returned."""
+    from agent.context_compressor import SUMMARY_PREFIX
+
+    c = _bridge_compressor(compression_remote="on")
+    mocked = f"{SUMMARY_PREFIX}\nrolled-up middle summary"
+    with patch.object(c, "_generate_summary", return_value=mocked), patch(
+        "agent.context_compressor.build_compaction_sidecar",
+        side_effect=ValueError("max_item_chars is too small"),
+    ):
+        result = c.compress(_bridge_transcript(), current_tokens=90_000)
+    # The compression itself still completed — only the sidecar was lost.
+    assert all("codex_output_items" not in m for m in result)
+    assert c._last_compression_made_progress is True
+
+
+def test_wrap_truncates_multibyte_summary_cleanly():
+    """GAP-D: truncating a multibyte summary never splits a character — the
+    capped envelope still decodes and the retained text is a clean tail of
+    whole characters (no replacement chars / partial sequences)."""
+    route = _local_route()
+    huge = "中" * 40_000  # each character is 3 UTF-8 bytes
+    item = wrap_summary_as_compaction_item(huge, route, max_item_chars=2000)
+    envelope = item["encrypted_content"]
+    assert envelope.startswith(BRIDGE_ENVELOPE_PREFIX)
+    assert len(envelope) <= 2000
+    payload = unwrap_compaction_item(item)
+    assert payload["summary_text"]
+    # Truncation keeps the summary TAIL of whole characters, matching the
+    # original tail verbatim — never a split or mojibake boundary.
+    assert payload["summary_text"] == huge[-len(payload["summary_text"]):]
+    assert payload["summary_text"].endswith("中")
+    assert "�" not in payload["summary_text"]
+    assert payload["route"] == route.to_dict()
+
+
+def test_wrap_defaults_created_at_to_now():
+    """GAP-D: when created_at is omitted the envelope seals the current time,
+    so continuation code can order checkpoints without extra plumbing."""
+    route = _local_route()
+    before = time.time()
+    item = wrap_summary_as_compaction_item("checkpoint body", route)
+    after = time.time()
+    payload = unwrap_compaction_item(item)
+    assert before - 1 <= payload["created_at"] <= after + 1
 
