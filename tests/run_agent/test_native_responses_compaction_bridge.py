@@ -1,4 +1,5 @@
-"""Unit tests for the ported native Responses compaction policy primitives.
+"""Unit tests for the ported native Responses compaction policy primitives
+and the local-summary bridge.
 
 Covers the dependency-free policy/ledger layer in ``agent/responses_compaction.py``:
 the capability state machine, route normalization, checkpoint digests, request
@@ -6,9 +7,16 @@ override validation, and the ``session_db=None`` graceful paths. The durable
 ``session_db``-backed persistence paths (``get_codex_responses_compaction_state`` /
 ``compare_and_set_codex_responses_compaction_state``) belong to a later task and
 are not exercised here.
+
+The second half covers the local-summary bridge: wrapping a local handoff
+summary into a Responses compaction input item (``wrap_summary_as_compaction_item``
+/ ``unwrap_compaction_item``), stamping it for sidecar custody
+(``compaction_item_to_sidecar``), and the ``ContextCompressor.compress()`` mount
+gate driven by ``compression.remote`` (auto/on/off).
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -16,8 +24,10 @@ from agent.codex_responses_adapter import (
     _chat_messages_to_responses_input,
     _preflight_codex_input_items,
 )
+from agent.context_compressor import ContextCompressor
 from agent.responses_compaction import (
     ALL_CAPABILITY_STATES,
+    BRIDGE_ENVELOPE_PREFIX,
     CAPABILITY_STATES,
     CHECKPOINT_REQUIRED_CAPABILITY_STATES,
     EVICTABLE_CAPABILITY_STATES,
@@ -29,8 +39,10 @@ from agent.responses_compaction import (
     NativeCompactionPolicy,
     NativeCompactionRoute,
     NativeCompactionStateError,
+    _BRIDGE_ENVELOPE_VERSION,
     build_native_request_overrides,
     compaction_checkpoint_digest,
+    compaction_item_to_sidecar,
     compaction_route_key,
     load_compaction_ledger,
     load_policy_for_route,
@@ -39,8 +51,10 @@ from agent.responses_compaction import (
     read_policy_for_route,
     route_for_request,
     should_defer_automatic_hermes_compaction,
+    unwrap_compaction_item,
     validate_native_request_overrides,
     validate_responses_continuation_overrides,
+    wrap_summary_as_compaction_item,
 )
 
 
@@ -491,4 +505,218 @@ def test_preflight_accepts_user_summary_message():
     assert normalized_str[0]["content"] == [
         {"type": "input_text", "text": "plain summary"}
     ]
+
+
+# ---------------------------------------------------------------------------
+# Local-summary bridge (agent/responses_compaction.py + context_compressor)
+# ---------------------------------------------------------------------------
+
+
+def _local_route() -> NativeCompactionRoute:
+    """Route for a local DeepSeek-class fork (issuer falls to the catch-all
+    ``other:<endpoint>`` bucket)."""
+    return NativeCompactionRoute(
+        issuer_kind="other:https://opencode.ai/zen/go/v1",
+        endpoint="https://opencode.ai/zen/go/v1",
+        model="deepseek-v4-flash",
+    )
+
+
+def _bridge_compressor(*, compression_remote: str = "auto") -> ContextCompressor:
+    """ContextCompressor with mocked deps and a tight tail budget so the
+    sidecar mount is observable and fast (no LLM/network calls)."""
+    with patch(
+        "agent.context_compressor.get_model_context_length",
+        return_value=100_000,
+    ):
+        c = ContextCompressor(
+            model="deepseek-v4-flash",
+            base_url="https://opencode.ai/zen/go/v1",
+            provider="opencode-go",
+            threshold_percent=0.85,
+            protect_first_n=2,
+            protect_last_n=2,
+            quiet_mode=True,
+            compression_remote=compression_remote,
+        )
+        c.tail_token_budget = 10
+        return c
+
+
+def _bridge_transcript() -> list:
+    """Compressible transcript whose head ends on a user turn, so the
+    summary lands as a standalone assistant message (the ideal mount)."""
+    return [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "initial"},
+    ] + [
+        {"role": "user", "content": f"middle q{i}"}
+        if i % 2 == 0
+        else {"role": "assistant", "content": f"middle reply {i}"}
+        for i in range(12)
+    ] + [
+        {"role": "user", "content": "the visible question"},
+        {"role": "assistant", "content": "reply"},
+        {"role": "user", "content": "follow up"},
+    ]
+
+
+def test_wrap_unwrap_roundtrip():
+    route = _local_route()
+    created_at = 1_752_000_000.5
+    item = wrap_summary_as_compaction_item(
+        "handoff summary body",
+        route,
+        created_at=created_at,
+        token_savings_est=12_345,
+    )
+    assert item["type"] == "compaction"
+    assert item["encrypted_content"].startswith(BRIDGE_ENVELOPE_PREFIX)
+    payload = unwrap_compaction_item(item)
+    assert payload["v"] == _BRIDGE_ENVELOPE_VERSION
+    assert payload["summary_text"] == "handoff summary body"
+    assert payload["created_at"] == created_at
+    assert payload["token_savings_est"] == 12_345
+    assert payload["route"] == route.to_dict()
+    assert NativeCompactionRoute.from_dict(payload["route"]) == route
+
+    # Malformed / non-bridge payloads are rejected, never silently decoded.
+    with pytest.raises(ValueError, match="not a bridge"):
+        unwrap_compaction_item(
+            {"type": "compaction", "encrypted_content": "opaque-provider-blob"}
+        )
+    with pytest.raises(ValueError, match="encrypted_content"):
+        unwrap_compaction_item({"type": "compaction"})
+
+
+def test_wrap_truncates_oversized_summary():
+    route = _local_route()
+    huge = "x" * 40_000
+    item = wrap_summary_as_compaction_item(huge, route, max_item_chars=2000)
+    assert item["type"] == "compaction"
+    envelope = item["encrypted_content"]
+    # The envelope header survives the cap and the item stays on budget.
+    assert envelope.startswith(BRIDGE_ENVELOPE_PREFIX)
+    assert len(envelope) <= 2000
+    payload = unwrap_compaction_item(item)
+    assert payload["v"] == _BRIDGE_ENVELOPE_VERSION
+    # Truncation keeps the summary TAIL — the newest recovered state lives at
+    # the end of a handoff summary — never the head.
+    assert payload["summary_text"].endswith("x" * 200)
+    assert payload["summary_text"] == huge[-len(payload["summary_text"]) :]
+    assert len(payload["summary_text"]) < len(huge)
+    assert payload["route"] == route.to_dict()
+
+    # A cap that cannot even hold the envelope header fails closed.
+    with pytest.raises(ValueError, match="too small"):
+        wrap_summary_as_compaction_item("tiny", route, max_item_chars=10)
+
+
+def test_sidecar_carries_route_stamps():
+    route = _local_route()
+    item = wrap_summary_as_compaction_item("checkpoint body", route)
+    sidecar = compaction_item_to_sidecar(item, route)
+    assert sidecar["_issuer_kind"] == route.issuer_kind
+    assert sidecar["_compaction_route"] == route.to_dict()
+    # The opaque payload is untouched by the stamping.
+    assert sidecar["type"] == "compaction"
+    assert sidecar["encrypted_content"] == item["encrypted_content"]
+    # The stamped sidecar satisfies the adapter replay fence verbatim:
+    # same issuer, same canonical route dict.
+    assert sidecar["_issuer_kind"] == route.issuer_kind
+    assert sidecar["_compaction_route"] == route.to_dict()
+
+
+def test_wrap_rejects_empty_summary():
+    route = _local_route()
+    with pytest.raises(ValueError, match="non-empty"):
+        wrap_summary_as_compaction_item("", route)
+    with pytest.raises(ValueError, match="non-empty"):
+        wrap_summary_as_compaction_item("   \n\t ", route)
+    with pytest.raises(ValueError, match="NativeCompactionRoute"):
+        wrap_summary_as_compaction_item("summary", "not-a-route")  # type: ignore[arg-type]
+
+
+def test_compress_attaches_sidecar_when_remote_enabled():
+    from agent.context_compressor import (
+        COMPRESSED_SUMMARY_METADATA_KEY,
+        SUMMARY_PREFIX,
+    )
+
+    c = _bridge_compressor(compression_remote="auto")
+    mocked = f"{SUMMARY_PREFIX}\nrolled-up middle summary"
+    with patch.object(c, "_generate_summary", return_value=mocked):
+        result = c.compress(_bridge_transcript(), current_tokens=90_000)
+
+    # Exactly one boundary message carries the sidecar, and it is the fresh
+    # assistant-role summary carrier — the compaction response itself.
+    carriers = [m for m in result if m.get("codex_output_items")]
+    assert len(carriers) == 1
+    boundary = carriers[0]
+    assert boundary["role"] == "assistant"
+    assert boundary.get(COMPRESSED_SUMMARY_METADATA_KEY)
+
+    # The sidecar is the wrapped, route-stamped compaction item.
+    sidecar = boundary["codex_output_items"]
+    assert len(sidecar) == 1
+    item = sidecar[0]
+    expected_route = route_for_request(
+        provider="opencode-go",
+        endpoint="https://opencode.ai/zen/go/v1",
+        model="deepseek-v4-flash",
+    )
+    assert item["type"] == "compaction"
+    assert item["encrypted_content"].startswith(BRIDGE_ENVELOPE_PREFIX)
+    assert item["_issuer_kind"] == expected_route.issuer_kind
+    assert item["_compaction_route"] == expected_route.to_dict()
+    payload = unwrap_compaction_item(item)
+    assert payload["v"] == _BRIDGE_ENVELOPE_VERSION
+    assert "rolled-up middle summary" in payload["summary_text"]
+    assert payload["route"] == expected_route.to_dict()
+
+    # End to end: the responses adapter accepts the mounted sidecar as the
+    # new request prefix and the live tail survives the projection.
+    items = _chat_messages_to_responses_input(
+        result,
+        current_issuer_kind=expected_route.issuer_kind,
+        current_compaction_route=expected_route.to_dict(),
+    )
+    assert items[0]["type"] == "compaction"
+    assert items[0]["encrypted_content"].startswith(BRIDGE_ENVELOPE_PREFIX)
+    assert "the visible question" in str([i.get("content") for i in items])
+
+
+def test_compress_unchanged_when_remote_off():
+    from agent.context_compressor import SUMMARY_PREFIX
+
+    mocked = f"{SUMMARY_PREFIX}\nrolled-up middle summary"
+    c_off = _bridge_compressor(compression_remote="off")
+    c_on = _bridge_compressor(compression_remote="on")
+    messages = _bridge_transcript()
+    with patch.object(c_off, "_generate_summary", return_value=mocked), patch.object(
+        c_on, "_generate_summary", return_value=mocked
+    ):
+        result_off = c_off.compress(messages, current_tokens=90_000)
+        result_on = c_on.compress(messages, current_tokens=90_000)
+    # remote=off never mounts: output carries no sidecar at all.
+    assert all("codex_output_items" not in m for m in result_off)
+    # And it is byte-identical to the mounted output minus the sidecar key —
+    # the only difference the bridge introduces is the sidecar itself.
+    stripped_on = [
+        {k: v for k, v in m.items() if k != "codex_output_items"}
+        for m in result_on
+    ]
+    assert stripped_on == result_off
+    # Unrecognized remote values normalize to the conservative off.
+    assert _bridge_compressor(compression_remote="bogus").compression_remote == "off"
+
+
+def test_compress_fallback_never_mounts_sidecar():
+    """The deterministic fallback carries no recovered information worth
+    checkpointing — even with remote enabled it must never mount."""
+    c = _bridge_compressor(compression_remote="on")
+    with patch.object(c, "_generate_summary", return_value=None):
+        result = c.compress(_bridge_transcript(), current_tokens=90_000)
+    assert c._last_summary_fallback_used is True
+    assert all("codex_output_items" not in m for m in result)
 

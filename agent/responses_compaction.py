@@ -8,10 +8,12 @@ creating import cycles.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import base64
 import hashlib
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -1671,3 +1673,154 @@ def complete_native_compaction_checkpoint(
     if staged is policy or staged == policy:
         agent._native_compaction_pending_policy = None
     return receipt
+
+
+# ---------------------------------------------------------------------------
+# Local-summary bridge (fork-specific; upstream 76950 has no equivalent).
+#
+# DeepSeek-class local forks compress conversation history with a local
+# summary but run on the Responses API surface, which only understands
+# provider-minted ``encrypted_content`` compaction items. The bridge wraps the
+# local summary into a fake Responses compaction input item (an opaque
+# envelope) and mounts it as a ``codex_output_items`` sidecar on the assistant
+# boundary message. The responses adapter replay branch then treats the
+# envelope as the new request prefix — the same 0-token-overhead shape a real
+# provider compaction response would produce.
+# ---------------------------------------------------------------------------
+
+BRIDGE_ENVELOPE_PREFIX = "hc2:"
+_BRIDGE_ENVELOPE_VERSION = 2
+
+
+def _bridge_envelope_encode(payload: Mapping[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return BRIDGE_ENVELOPE_PREFIX + base64.urlsafe_b64encode(
+        raw.encode("utf-8")
+    ).decode("ascii")
+
+
+def wrap_summary_as_compaction_item(
+    summary_text: str,
+    route: NativeCompactionRoute,
+    *,
+    max_item_chars: int = 12000,
+    created_at: Optional[float] = None,
+    token_savings_est: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Wrap a local summary into a Responses compaction input item.
+
+    Envelope shape: ``"hc2:" + base64.urlsafe_b64encode(json({v: 2,
+    summary_text, route: {issuer_kind, endpoint, model}, created_at,
+    token_savings_est}))``. The route is serialized in its canonical
+    normalized form so ``compaction_route_key`` and the replay branch see
+    exactly what ``route_for_request`` produces.
+
+    Oversized summaries are truncated preserving the envelope header and the
+    summary TAIL (the newest recovered state lives at the end of a handoff
+    summary). Returns the provider-shaped output item
+    ``{"type": "compaction", "encrypted_content": "<envelope>"}`` — the same
+    shape the responses adapter persists and replays.
+    """
+    if not isinstance(summary_text, str) or not summary_text.strip():
+        raise ValueError("summary_text must be a non-empty string")
+    if not isinstance(route, NativeCompactionRoute):
+        raise ValueError("route must be a NativeCompactionRoute")
+    try:
+        max_item_chars = int(max_item_chars)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_item_chars must be an integer") from exc
+    if max_item_chars < len(BRIDGE_ENVELOPE_PREFIX) + 8:
+        raise ValueError("max_item_chars is too small to hold a bridge envelope")
+    if created_at is None:
+        created_at = time.time()
+
+    payload: Dict[str, Any] = {
+        "v": _BRIDGE_ENVELOPE_VERSION,
+        "summary_text": summary_text,
+        "route": route.to_dict(),
+        "created_at": created_at,
+        "token_savings_est": token_savings_est,
+    }
+    envelope = _bridge_envelope_encode(payload)
+    if len(envelope) <= max_item_chars:
+        return {"type": "compaction", "encrypted_content": envelope}
+
+    def _fits(keep: int) -> bool:
+        candidate = dict(payload)
+        candidate["summary_text"] = summary_text[-keep:]
+        return len(_bridge_envelope_encode(candidate)) <= max_item_chars
+
+    if not _fits(1):
+        raise ValueError(
+            "max_item_chars is too small to fit the envelope header plus "
+            "any summary content"
+        )
+    lo, hi = 1, len(summary_text)
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if _fits(mid):
+            lo = mid
+        else:
+            hi = mid
+    payload["summary_text"] = summary_text[-lo:]
+    return {"type": "compaction", "encrypted_content": _bridge_envelope_encode(payload)}
+
+
+def unwrap_compaction_item(item: Mapping[str, Any]) -> Dict[str, Any]:
+    """Reverse-decode a bridge-wrapped compaction item (tests/diagnostics).
+
+    Returns the decoded envelope payload. Raises ``ValueError`` for any
+    malformed envelope (wrong shape, bad base64/JSON, unsupported version,
+    missing summary text or route) so callers can distinguish bridge items
+    from genuine provider-minted ``encrypted_content``.
+    """
+    if not isinstance(item, Mapping):
+        raise ValueError("compaction item must be an object")
+    encrypted = item.get("encrypted_content")
+    if not isinstance(encrypted, str) or not encrypted:
+        raise ValueError("compaction item is missing encrypted_content")
+    if not encrypted.startswith(BRIDGE_ENVELOPE_PREFIX):
+        raise ValueError("compaction item is not a bridge-wrapped envelope")
+    try:
+        raw = base64.urlsafe_b64decode(
+            encrypted[len(BRIDGE_ENVELOPE_PREFIX):].encode("ascii")
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, TypeError) as exc:
+        raise ValueError("compaction item envelope is malformed") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("compaction item envelope payload must be an object")
+    if payload.get("v") != _BRIDGE_ENVELOPE_VERSION:
+        raise ValueError("compaction item envelope has an unsupported version")
+    summary_text = payload.get("summary_text")
+    if not isinstance(summary_text, str) or not summary_text:
+        raise ValueError("compaction item envelope is missing summary_text")
+    route_value = payload.get("route")
+    if not isinstance(route_value, Mapping):
+        raise ValueError("compaction item envelope has an invalid route")
+    try:
+        NativeCompactionRoute.from_dict(route_value)
+    except NativeCompactionStateError as exc:
+        raise ValueError("compaction item envelope has an invalid route") from exc
+    return payload
+
+
+def compaction_item_to_sidecar(
+    item: Dict[str, Any],
+    route: NativeCompactionRoute,
+) -> Dict[str, Any]:
+    """Stamp a compaction item with its route fences for sidecar custody.
+
+    The ordered sidecar validator and the responses adapter replay branch
+    require every item to carry ``_issuer_kind`` matching
+    ``route.issuer_kind`` and a canonical ``_compaction_route`` dict; the
+    item itself keeps its opaque ``encrypted_content`` untouched.
+    """
+    if not isinstance(item, Mapping):
+        raise ValueError("compaction item must be an object")
+    if not isinstance(route, NativeCompactionRoute):
+        raise ValueError("route must be a NativeCompactionRoute")
+    sidecar = dict(item)
+    sidecar["_issuer_kind"] = route.issuer_kind
+    sidecar["_compaction_route"] = route.to_dict()
+    return sidecar

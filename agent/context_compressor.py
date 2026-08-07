@@ -40,6 +40,11 @@ from agent.model_metadata import (
     estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from agent.responses_compaction import (
+    compaction_item_to_sidecar,
+    route_for_request,
+    wrap_summary_as_compaction_item,
+)
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -2311,6 +2316,8 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
+        compression_remote: str = "off",
+        compression_remote_max_item_chars: int = 12000,
     ):
         self.model = model
         self.base_url = base_url
@@ -2383,6 +2390,33 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+
+        # ── Native Responses compaction bridge (local fork) ─────────
+        # ``compression.remote`` (auto/on/off) gates whether a successfully
+        # generated local summary is wrapped into a Responses compaction input
+        # item and mounted as a ``codex_output_items`` sidecar on the assistant
+        # boundary message (consumed by the responses adapter replay branch).
+        # "off" keeps compress() byte-identical to the pre-bridge behavior;
+        # the constructor default is the conservative off so direct
+        # constructions never surprise — agent_init plumbs the real config
+        # value (default "auto") from ``compression.remote`` at startup.
+        # ``compression_remote_max_item_chars`` caps the wrapped envelope.
+        _raw_remote = (
+            compression_remote.strip().lower()
+            if isinstance(compression_remote, str)
+            else ""
+        )
+        self.compression_remote = (
+            _raw_remote if _raw_remote in {"auto", "on", "off"} else "off"
+        )
+        if (
+            isinstance(compression_remote_max_item_chars, bool)
+            or not isinstance(compression_remote_max_item_chars, int)
+        ):
+            compression_remote_max_item_chars = 12000
+        self.compression_remote_max_item_chars = max(
+            int(compression_remote_max_item_chars), 512
+        )
 
         # ── Micro-compaction (per-turn rolling compaction) ─────────
         # Default: OFF. Each pass rewrites already-sent history, so it breaks
@@ -6159,6 +6193,74 @@ This compaction should PRIORITISE preserving all information related to the focu
             merged.append(msg)
         return merged
 
+    def _find_compaction_sidecar_mount_idx(
+        self, compressed: List[Dict[str, Any]]
+    ) -> Optional[int]:
+        """Locate the assistant message that owns the compaction boundary.
+
+        Prefers the fresh summary carrier when it is assistant-role — the
+        summary IS the compaction response, so everything before it is
+        replaced by the compaction item while the protected tail survives
+        the replay projection. Falls back to the newest assistant message at
+        or before the summary carrier so a user-role summary and the live
+        tail are preserved; last resort is the newest assistant message
+        overall. Returns None only when the list has no assistant message.
+        """
+        summary_idx: Optional[int] = None
+        for idx in range(len(compressed) - 1, -1, -1):
+            msg = compressed[idx]
+            if isinstance(msg, dict) and msg.get(COMPRESSED_SUMMARY_METADATA_KEY):
+                summary_idx = idx
+                break
+        if summary_idx is not None:
+            if compressed[summary_idx].get("role") == "assistant":
+                return summary_idx
+            for idx in range(summary_idx, -1, -1):
+                if compressed[idx].get("role") == "assistant":
+                    return idx
+        for idx in range(len(compressed) - 1, -1, -1):
+            if compressed[idx].get("role") == "assistant":
+                return idx
+        return None
+
+    def _maybe_attach_compaction_sidecar(
+        self,
+        compressed: List[Dict[str, Any]],
+        *,
+        summary_text: str,
+        token_savings_est: Optional[int] = None,
+    ) -> None:
+        """Attach the wrapped local summary as a Responses compaction sidecar.
+
+        Bridge gate: only when ``compression_remote`` is not ``"off"`` AND the
+        summary was genuinely generated. The deterministic failure/feasibility
+        fallback never mounts — it carries no recovered information worth
+        checkpointing. Both the off and fallback paths leave ``compressed``
+        untouched, so remote=off stays byte-identical to the pre-bridge
+        compressor.
+        """
+        if self.compression_remote == "off":
+            return
+        if self._last_summary_fallback_used or not summary_text:
+            return
+        mount_idx = self._find_compaction_sidecar_mount_idx(compressed)
+        if mount_idx is None:
+            return
+        route = route_for_request(
+            provider=str(self.provider or ""),
+            endpoint=str(self.base_url or ""),
+            model=str(self.model or ""),
+        )
+        item = wrap_summary_as_compaction_item(
+            summary_text,
+            route,
+            max_item_chars=self.compression_remote_max_item_chars,
+            token_savings_est=token_savings_est,
+        )
+        compressed[mount_idx]["codex_output_items"] = [
+            compaction_item_to_sidecar(item, route)
+        ]
+
     def compress(
         self,
         messages: List[Dict[str, Any]],
@@ -6681,6 +6783,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                 reason=None if feasibility_skip else self._last_summary_error,
             )
 
+        # Native Responses compaction bridge: snapshot the raw summary text
+        # BEFORE the standalone-role path appends the end marker (or the
+        # merge path wraps it in delimiters) — the wrapped envelope must
+        # carry the checkpoint content itself, not the in-message formatting
+        # directives that only make sense inside the rendered transcript.
+        _bridge_summary_text = summary
+
         tail_messages: List[Dict[str, Any]] = []
         # Start at tail_start (not compress_end): the restart-decay scan may
         # have advanced it past a summary that sat beyond compress_end
@@ -6991,6 +7100,19 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
         self._proactive_prune_rearm_tokens = 0
+
+        # Native Responses compaction bridge: when compression.remote is not
+        # "off" and the summary was genuinely generated (never the
+        # deterministic fallback), wrap it into a Responses compaction input
+        # item and mount it as a ``codex_output_items`` sidecar on the
+        # boundary assistant message. Attaching here — after the terminal
+        # sanitizers, the token estimate, and the persistence-marker sweep —
+        # keeps remote=off output byte-identical to the pre-bridge compressor.
+        self._maybe_attach_compaction_sidecar(
+            compressed,
+            summary_text=_bridge_summary_text,
+            token_savings_est=max(saved_estimate, 0),
+        )
 
         return compressed
 
