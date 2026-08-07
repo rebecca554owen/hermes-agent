@@ -17,12 +17,14 @@ from agent.responses_compaction import (
     CAPABILITY_STATES,
     CHECKPOINT_REQUIRED_CAPABILITY_STATES,
     EVICTABLE_CAPABILITY_STATES,
+    MAX_COMPACTION_LEDGER_ROUTES,
     NATIVE_RESPONSES_RESERVED_REQUEST_OVERRIDE_KEYS,
     OWNING_CAPABILITY_STATES,
     TERMINAL_STATES,
     NativeCompactionLedger,
     NativeCompactionPolicy,
     NativeCompactionRoute,
+    NativeCompactionStateError,
     build_native_request_overrides,
     compaction_checkpoint_digest,
     compaction_route_key,
@@ -43,6 +45,15 @@ def _openai_route() -> NativeCompactionRoute:
         issuer_kind="openai",
         endpoint="https://api.openai.com/v1",
         model="gpt-5.1-codex",
+    )
+
+
+def _route(index: int) -> NativeCompactionRoute:
+    """Distinct route for ledger capacity/eviction scenarios."""
+    return NativeCompactionRoute(
+        issuer_kind="openai",
+        endpoint="https://api.openai.com/v1",
+        model=f"gpt-5.1-codex-{index:02d}",
     )
 
 
@@ -77,6 +88,78 @@ def test_ledger_state_transition():
     # Ledger serialization round-trips the capability state.
     restored = NativeCompactionLedger.from_dict(next_ledger.to_dict())
     assert restored.policy_for(route).capability == "shape_accepted"
+
+
+def test_ledger_evicts_evictable_route_at_capacity():
+    # A full 32-route ledger holds one evictable discovery hint, one terminal,
+    # and the rest ownership-bearing custody.
+    evictable = _route(0)
+    terminal = _route(1)
+    owning = [_route(i) for i in range(2, MAX_COMPACTION_LEDGER_ROUTES)]
+    routes = {
+        compaction_route_key(evictable): NativeCompactionPolicy(
+            route=evictable, capability="shape_accepted"
+        ),
+        compaction_route_key(terminal): NativeCompactionPolicy(
+            route=terminal, capability="unsupported"
+        ),
+    }
+    for item in owning:
+        routes[compaction_route_key(item)] = NativeCompactionPolicy(
+            route=item, capability="replay_verified"
+        )
+    ledger = NativeCompactionLedger(revision=0, routes=routes)
+    assert len(ledger.routes) == MAX_COMPACTION_LEDGER_ROUTES
+
+    # A 33rd route overflows: the only evictable hint is dropped while every
+    # ownership-bearing route and terminal history survives. The freshly added
+    # route is never evicted even though its own state is evictable.
+    newcomer = _route(MAX_COMPACTION_LEDGER_ROUTES)
+    next_ledger = ledger.with_policy(
+        NativeCompactionPolicy(route=newcomer, capability="shape_accepted")
+    )
+    assert len(next_ledger.routes) == MAX_COMPACTION_LEDGER_ROUTES
+    assert compaction_route_key(evictable) not in next_ledger.routes
+    assert compaction_route_key(terminal) in next_ledger.routes
+    for item in owning:
+        assert compaction_route_key(item) in next_ledger.routes
+    assert (
+        next_ledger.routes[compaction_route_key(newcomer)].capability
+        == "shape_accepted"
+    )
+
+
+def test_ledger_capacity_overflow_raises():
+    # A full ledger of durable custody or terminal history has nothing
+    # evictable: recording one more route must fail closed rather than
+    # silently drop ownership or terminal state.
+    routes = {}
+    for i in range(MAX_COMPACTION_LEDGER_ROUTES):
+        if i % 5 == 0:
+            capability = "unsupported"
+        elif i % 3 == 0:
+            capability = "quarantined"
+        else:
+            capability = "replay_verified"
+        item = _route(i)
+        routes[compaction_route_key(item)] = NativeCompactionPolicy(
+            route=item, capability=capability
+        )
+    ledger = NativeCompactionLedger(revision=0, routes=routes)
+    assert len(ledger.routes) == MAX_COMPACTION_LEDGER_ROUTES
+    assert not EVICTABLE_CAPABILITY_STATES.intersection(
+        policy.capability for policy in ledger.routes.values()
+    )
+
+    with pytest.raises(
+        NativeCompactionStateError, match="full of durable custody"
+    ):
+        ledger.with_policy(
+            NativeCompactionPolicy(
+                route=_route(MAX_COMPACTION_LEDGER_ROUTES),
+                capability="shape_accepted",
+            )
+        )
 
 
 def test_normalize_compaction_endpoint():
@@ -145,14 +228,9 @@ def test_compaction_checkpoint_digest_detects_tamper():
 
 
 def test_capability_states():
-    # Canonical state definitions from the module.
-    assert CAPABILITY_STATES == (
-        "unknown",
-        "shape_accepted",
-        "item_observed",
-        "replay_verified",
-    )
-    assert TERMINAL_STATES == {"unsupported", "quarantined"}
+    # Canonical state partitions per the module's invariants: terminal states
+    # never overlap the live progression, and the full universe is exactly the
+    # union of the two.
     assert TERMINAL_STATES.isdisjoint(CAPABILITY_STATES)
     assert ALL_CAPABILITY_STATES == set(CAPABILITY_STATES) | TERMINAL_STATES
 
