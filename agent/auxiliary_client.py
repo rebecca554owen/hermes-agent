@@ -6292,15 +6292,21 @@ def resolve_provider_client(
                          provider, ", ".join(tried_sources))
             return None, None
 
-        base_url = _to_openai_base_url(raw_base_url)
-        # Honour an explicit base_url override from the caller — used when a
-        # fallback_model entry (or custom_providers lookup) routes through a
-        # built-in provider name but targets a user-specified endpoint.
-        if explicit_base_url:
-            base_url = _to_openai_base_url(explicit_base_url.strip().rstrip("/"))
-
         default_model = _get_aux_model_for_provider(provider)
         final_model = _normalize_resolved_model(model or default_model, provider)
+
+        if provider in {"opencode-zen", "opencode-go"}:
+            from hermes_cli.models import (
+                normalize_opencode_base_url,
+                opencode_model_api_mode,
+            )
+
+            api_mode = opencode_model_api_mode(provider, final_model)
+            raw_base_url = normalize_opencode_base_url(
+                provider, api_mode, raw_base_url
+            )
+
+        base_url = _to_openai_base_url(raw_base_url)
 
         if provider == "gemini":
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
