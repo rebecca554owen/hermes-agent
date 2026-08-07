@@ -731,6 +731,29 @@ DEFAULT_CONFIG = {
                                       # gpt-5.4 / 5.5 / 5.6 on OpenAI's direct API,
                                       # OpenRouter, and Copilot keep the global threshold
                                       # regardless.
+        "remote": "auto",             # Native Responses compaction bridge (local fork
+                                      # feature, not upstream). Three states:
+                                      #   auto — probe upstream capability per route:
+                                      #     shape_accepted → bridge delivery (local
+                                      #     summary wrapped as a compaction item prefix,
+                                      #     measured 0-token overhead on opencode-go);
+                                      #     item_observed → native mode (consume
+                                      #     upstream compaction items directly, skip
+                                      #     local summary generation).
+                                      #   on   — force bridge delivery; fall back to
+                                      #     local-only compression when the upstream
+                                      #     rejects the compaction shape.
+                                      #   off  — disable compaction delivery entirely;
+                                      #     behavior identical to the pre-bridge local
+                                      #     summary replacement. Requires a process
+                                      #     restart to take effect (loaded at agent
+                                      #     startup like the rest of this section).
+        "remote_max_item_chars": 12000,  # Cap for the compaction item's
+                                      # encrypted_content envelope (chars). Guards
+                                      # against oversized summaries exceeding an
+                                      # upstream's per-item limits; summaries longer
+                                      # than this are truncated with the envelope
+                                      # header and the summary tail preserved.
         "codex_gpt55_autoraise_notice": True,  # Display the one-time Codex gpt-5.4/5.5/5.6
                                       # autoraise banner. Set False to keep the
                                       # 85% threshold autoraise but suppress the
