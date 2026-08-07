@@ -12,6 +12,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.codex_responses_adapter import (
+    _chat_messages_to_responses_input,
+    _preflight_codex_input_items,
+)
 from agent.responses_compaction import (
     ALL_CAPABILITY_STATES,
     CAPABILITY_STATES,
@@ -348,3 +352,143 @@ def test_route_for_request_issuer_detection():
         model="gpt-5.1-codex",
     )
     assert github.issuer_kind == "github_responses"
+
+
+# ---------------------------------------------------------------------------
+# Adapter replay branch (agent/codex_responses_adapter.py)
+# ---------------------------------------------------------------------------
+
+
+def _openai_route_dict() -> dict:
+    return {
+        "issuer_kind": "openai",
+        "endpoint": "https://chatgpt.com/backend-api/codex",
+        "model": "gpt-5.1-codex",
+    }
+
+
+def _boundary_messages_with_sidecar(*, issuer: str = "openai") -> list:
+    """Transcript whose boundary assistant message carries an ordered
+    compaction sidecar stamped for *issuer* (same shape as what
+    _normalize_codex_response persists for a compaction turn)."""
+    route = _openai_route_dict() if issuer == "openai" else {
+        "issuer_kind": issuer,
+        "endpoint": "https://api.x.ai/v1",
+        "model": "grok-4.5",
+    }
+    return [
+        {"role": "user", "content": "old user"},
+        {"role": "assistant", "content": "old assistant"},
+        {
+            "role": "assistant",
+            "content": "boundary visible text",
+            "codex_output_items": [
+                {
+                    "type": "compaction",
+                    "encrypted_content": "opaque-compact-state",
+                    "_issuer_kind": issuer,
+                    "_compaction_route": route,
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "boundary visible text"}],
+                    "_issuer_kind": issuer,
+                    "_compaction_route": route,
+                },
+            ],
+        },
+        {"role": "user", "content": "new user"},
+    ]
+
+
+def test_replay_compaction_sidecar_prefix():
+    """A same-issuer compaction sidecar becomes the new request prefix: the
+    ordered output items replace all earlier history in the API projection
+    (compaction item first), while later transcript messages follow."""
+    items = _chat_messages_to_responses_input(
+        _boundary_messages_with_sidecar(),
+        current_issuer_kind="openai",
+        current_compaction_route=_openai_route_dict(),
+    )
+    assert [item.get("type") for item in items[:2]] == ["compaction", "message"]
+    assert items[0] == {
+        "type": "compaction",
+        "encrypted_content": "opaque-compact-state",
+    }
+    assert items[1]["content"][0]["text"] == "boundary visible text"
+    assert items[2] == {"role": "user", "content": "new user"}
+    # The pre-compaction history is replaced, not replayed alongside it.
+    assert all(item.get("content") != "old user" for item in items)
+
+
+def test_replay_compaction_digest_mismatch_fallback():
+    """A sidecar whose digest does not match the expected committed checkpoint
+    fails open to an intact transcript replay — stale in-memory checkpoints
+    must never win the projection."""
+    messages = _boundary_messages_with_sidecar()
+    bogus_digest = compaction_checkpoint_digest(
+        [{"type": "compaction", "encrypted_content": "newer-uncommitted"}]
+    )
+    items = _chat_messages_to_responses_input(
+        messages,
+        current_issuer_kind="openai",
+        current_compaction_route=_openai_route_dict(),
+        expected_compaction_digest=bogus_digest,
+    )
+    assert all(item.get("type") != "compaction" for item in items)
+    assert [item.get("content") for item in items] == [
+        "old user",
+        "old assistant",
+        "boundary visible text",
+        "new user",
+    ]
+
+
+def test_replay_compaction_foreign_issuer_ignored():
+    """A sidecar stamped for a different issuer is not replayed — the
+    encrypted blob is only decryptable by the minting endpoint."""
+    items = _chat_messages_to_responses_input(
+        _boundary_messages_with_sidecar(issuer="openai"),
+        current_issuer_kind="xai",
+        current_compaction_route={
+            "issuer_kind": "xai",
+            "endpoint": "https://api.x.ai/v1",
+            "model": "grok-4.5",
+        },
+    )
+    assert all(item.get("type") != "compaction" for item in items)
+    assert [item.get("content") for item in items] == [
+        "old user",
+        "old assistant",
+        "boundary visible text",
+        "new user",
+    ]
+
+
+def test_preflight_accepts_user_summary_message():
+    """After native compaction the provider may return a user-role summary
+    message inside the output items; preflight must accept it as the first
+    post-compaction input instead of rejecting every non-assistant message
+    item."""
+    normalized = _preflight_codex_input_items(
+        [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "summarized context"}],
+            }
+        ]
+    )
+    assert normalized[0]["role"] == "user"
+    assert normalized[0]["content"][0]["text"] == "summarized context"
+
+    # String content is normalized to the Responses input_text part shape.
+    normalized_str = _preflight_codex_input_items(
+        [{"type": "message", "role": "user", "content": "plain summary"}]
+    )
+    assert normalized_str[0]["role"] == "user"
+    assert normalized_str[0]["content"] == [
+        {"type": "input_text", "text": "plain summary"}
+    ]
+

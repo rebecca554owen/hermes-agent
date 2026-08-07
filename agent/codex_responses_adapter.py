@@ -21,6 +21,10 @@ from typing import Any, Dict, List, Optional
 
 from agent.message_sanitization import deterministic_call_id
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.responses_compaction import (
+    compaction_checkpoint_digest,
+    normalize_compaction_endpoint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +52,7 @@ def _classify_responses_issuer(
     if is_codex_backend:
         return "codex_backend"
     if base_url:
-        return f"other:{base_url}"
+        return f"other:{normalize_compaction_endpoint(base_url)}"
     return "other"
 
 
@@ -413,7 +417,10 @@ def _chat_messages_to_responses_input(
     is_xai_responses: bool = False,
     is_github_responses: bool = False,
     replay_encrypted_reasoning: bool = True,
+    replay_native_compaction: bool = True,
     current_issuer_kind: Optional[str] = None,
+    current_compaction_route: Optional[Dict[str, str]] = None,
+    expected_compaction_digest: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
@@ -458,6 +465,11 @@ def _chat_messages_to_responses_input(
     ``replay_encrypted_reasoning=False`` is the session-wide kill switch
     (drops ALL replay); ``current_issuer_kind`` is the per-item filter
     that runs only when replay is still enabled.
+
+    Native compaction replay additionally requires the exact route and, when
+    supplied, ``expected_compaction_digest`` of the complete ordered sidecar.
+    Route-only matches are insufficient because a newer uncommitted checkpoint
+    may coexist in memory with an older committed one during continuation.
     """
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
@@ -470,6 +482,62 @@ def _chat_messages_to_responses_input(
             continue
 
         if role in {"user", "assistant"}:
+            if role == "assistant":
+                output_sidecar = msg.get("codex_output_items")
+                if (
+                    replay_native_compaction
+                    and isinstance(output_sidecar, list)
+                    and current_issuer_kind
+                    and current_compaction_route
+                ):
+                    candidate: List[Dict[str, Any]] = []
+                    saw_compaction = False
+                    sidecar_valid = bool(output_sidecar)
+                    for raw_item in output_sidecar:
+                        if not isinstance(raw_item, dict):
+                            sidecar_valid = False
+                            break
+                        if raw_item.get("_issuer_kind") != current_issuer_kind:
+                            sidecar_valid = False
+                            break
+                        if raw_item.get("_compaction_route") != current_compaction_route:
+                            sidecar_valid = False
+                            break
+                        replay_item = {
+                            key: value
+                            for key, value in raw_item.items()
+                            if not str(key).startswith("_") and key != "id"
+                        }
+                        if replay_item.get("type") == "compaction":
+                            encrypted = replay_item.get("encrypted_content")
+                            if not isinstance(encrypted, str) or not encrypted:
+                                sidecar_valid = False
+                                break
+                            saw_compaction = True
+                        candidate.append(replay_item)
+                    if (
+                        sidecar_valid
+                        and expected_compaction_digest is not None
+                        and compaction_checkpoint_digest(output_sidecar)
+                        != expected_compaction_digest
+                    ):
+                        sidecar_valid = False
+                    if sidecar_valid and saw_compaction:
+                        try:
+                            candidate = _preflight_codex_input_items(
+                                candidate,
+                                is_github_responses=is_github_responses,
+                            )
+                        except ValueError:
+                            sidecar_valid = False
+                        if sidecar_valid:
+                            # The response output containing a compaction item
+                            # is the new request prefix. Keep the durable
+                            # transcript intact, but reset this API projection.
+                            items = candidate
+                            seen_item_ids.clear()
+                            continue
+
             content = msg.get("content", "")
             if isinstance(content, list):
                 content_parts = _chat_content_to_responses_parts(content, role=role)
@@ -794,6 +862,15 @@ def _preflight_codex_input_items(
             )
             continue
 
+        if item_type == "compaction":
+            encrypted = item.get("encrypted_content")
+            if not isinstance(encrypted, str) or not encrypted:
+                raise ValueError(
+                    f"Codex Responses input[{idx}] compaction item requires encrypted_content."
+                )
+            normalized.append({"type": "compaction", "encrypted_content": encrypted})
+            continue
+
         if item_type == "reasoning":
             encrypted = item.get("encrypted_content")
             if isinstance(encrypted, str) and encrypted:
@@ -824,9 +901,32 @@ def _preflight_codex_input_items(
 
         if item_type == "message":
             role = item.get("role")
-            if role != "assistant":
-                raise ValueError(f"Codex Responses input[{idx}] message items must have role='assistant'.")
+            if role not in {"user", "assistant"}:
+                raise ValueError(
+                    f"Codex Responses input[{idx}] message items must have role='user' or 'assistant'."
+                )
             content = item.get("content")
+            if role == "user":
+                if isinstance(content, str):
+                    normalized_content = [
+                        {"type": "input_text", "text": content}
+                    ] if content else []
+                else:
+                    normalized_content = _chat_content_to_responses_parts(
+                        content, role="user"
+                    )
+                if not normalized_content:
+                    raise ValueError(
+                        f"Codex Responses input[{idx}] user message item must contain input content."
+                    )
+                normalized.append(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": normalized_content,
+                    }
+                )
+                continue
             if not isinstance(content, list):
                 raise ValueError(f"Codex Responses input[{idx}] message item must have content list.")
             normalized_content = []
@@ -1031,7 +1131,7 @@ def _preflight_codex_api_kwargs(
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key",
         "prompt_cache_retention", "service_tier",
-        "extra_headers", "extra_body", "timeout",
+        "extra_headers", "extra_body", "timeout", "context_management",
     }
     normalized: Dict[str, Any] = {
         "model": model,
@@ -1041,6 +1141,31 @@ def _preflight_codex_api_kwargs(
     }
     if normalized_tools is not None:
         normalized["tools"] = normalized_tools
+
+    context_management = api_kwargs.get("context_management")
+    if context_management is not None:
+        if not isinstance(context_management, list) or len(context_management) != 1:
+            raise ValueError(
+                "Codex Responses 'context_management' must contain exactly one compaction object."
+            )
+        compact = context_management[0]
+        if not isinstance(compact, dict) or set(compact) - {"type", "compact_threshold"}:
+            raise ValueError(
+                "Codex Responses compaction context-management item has unsupported fields."
+            )
+        threshold = compact.get("compact_threshold")
+        if (
+            compact.get("type") != "compaction"
+            or not isinstance(threshold, int)
+            or isinstance(threshold, bool)
+            or threshold <= 0
+        ):
+            raise ValueError(
+                "Codex Responses compaction requires type='compaction' and a positive integer compact_threshold."
+            )
+        normalized["context_management"] = [
+            {"type": "compaction", "compact_threshold": threshold}
+        ]
 
     # Pass through reasoning config
     reasoning = api_kwargs.get("reasoning")
@@ -1097,7 +1222,52 @@ def _preflight_codex_api_kwargs(
     if extra_body is not None:
         if not isinstance(extra_body, dict):
             raise ValueError("Codex Responses request 'extra_body' must be an object.")
-        # Pass extra_body through verbatim — used by xAI Responses to
+        if any(not isinstance(key, str) for key in extra_body):
+            raise ValueError(
+                "Codex Responses request 'extra_body' keys must be strings."
+            )
+        # The SDK merges ``extra_body`` into the first-class JSON body after
+        # validating typed kwargs.  Reject every recognized Responses field
+        # here so this extension seam cannot override ``store=False``, inject
+        # provider-side continuation, or bypass context-management validation.
+        # ``prompt_cache_key`` is the one deliberate duplicate: xAI requires
+        # that otherwise non-stateful routing hint at body level on SDK builds
+        # whose typed Responses signature omits it.
+        reserved_extra_body_keys = {
+            "background",
+            "context_management",
+            "conversation",
+            "include",
+            "input",
+            "instructions",
+            "max_output_tokens",
+            "metadata",
+            "model",
+            "modalities",
+            "parallel_tool_calls",
+            "previous_response_id",
+            "prompt",
+            "prompt_cache_retention",
+            "reasoning",
+            "safety_identifier",
+            "service_tier",
+            "store",
+            "stream",
+            "temperature",
+            "text",
+            "tool_choice",
+            "tools",
+            "top_logprobs",
+            "truncation",
+            "user",
+        }
+        collisions = sorted(reserved_extra_body_keys.intersection(extra_body))
+        if collisions:
+            raise ValueError(
+                "Codex Responses request 'extra_body' contains reserved "
+                f"Responses field(s): {', '.join(collisions)}."
+            )
+        # Pass remaining extensions through — used by xAI Responses to
         # carry `prompt_cache_key` as a body-level field (the documented
         # cache-routing surface on /v1/responses). The openai SDK
         # serializes extra_body into the JSON body without per-field
@@ -1229,10 +1399,40 @@ def _format_responses_error(error_obj: Any, response_status: str) -> str:
 # Full response normalization
 # ---------------------------------------------------------------------------
 
+
+def _plain_response_value(value: Any) -> Any:
+    """Convert SDK response items to JSON-compatible ordered wire data."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key): _plain_response_value(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if isinstance(value, (list, tuple)):
+        return [_plain_response_value(item) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _plain_response_value(model_dump(exclude_none=True))
+        except TypeError:
+            return _plain_response_value(model_dump())
+    raw = getattr(value, "__dict__", None)
+    if isinstance(raw, dict):
+        return {
+            str(key): _plain_response_value(item)
+            for key, item in raw.items()
+            if not str(key).startswith("_") and item is not None
+        }
+    return str(value)
+
+
 def _normalize_codex_response(
     response: Any,
     *,
     issuer_kind: Optional[str] = None,
+    compaction_route: Optional[Dict[str, str]] = None,
 ) -> tuple[Any, str]:
     """Normalize a Responses API object to an assistant_message-like object.
 
@@ -1290,6 +1490,28 @@ def _normalize_codex_response(
         error_msg = _format_responses_error(error_obj, response_status)
         raise RuntimeError(error_msg)
 
+    plain_output_items = [
+        value
+        for value in (_plain_response_value(item) for item in output)
+        if isinstance(value, dict)
+    ]
+    saw_compaction_item = any(
+        item.get("type") == "compaction"
+        and isinstance(item.get("encrypted_content"), str)
+        and bool(item.get("encrypted_content"))
+        for item in plain_output_items
+    )
+    codex_output_items: Optional[List[Dict[str, Any]]] = None
+    if saw_compaction_item:
+        codex_output_items = []
+        for item in plain_output_items:
+            stamped = dict(item)
+            if issuer_kind:
+                stamped["_issuer_kind"] = issuer_kind
+            if compaction_route:
+                stamped["_compaction_route"] = dict(compaction_route)
+            codex_output_items.append(stamped)
+
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
     reasoning_items_raw: List[Dict[str, Any]] = []
@@ -1344,6 +1566,12 @@ def _normalize_codex_response(
             saw_streaming_or_item_incomplete = True
 
         if item_type == "message":
+            item_role = str(getattr(item, "role", "assistant") or "assistant").strip().lower()
+            if item_role != "assistant":
+                # Explicit /responses/compact output can carry historical user
+                # messages. They belong only to the ordered sidecar, never to
+                # the visible assistant answer assembled below.
+                continue
             item_phase = getattr(item, "phase", None)
             normalized_phase = None
             is_commentary_phase = False
@@ -1549,6 +1777,7 @@ def _normalize_codex_response(
         reasoning_details=None,
         codex_reasoning_items=reasoning_items_raw or None,
         codex_message_items=message_items_raw or None,
+        codex_output_items=codex_output_items,
     )
 
     if tool_calls:
@@ -1560,6 +1789,10 @@ def _normalize_codex_response(
     elif saw_streaming_or_item_incomplete:
         finish_reason = "incomplete"
     elif (has_incomplete_items or saw_commentary_phase) and not saw_final_answer_phase:
+        finish_reason = "incomplete"
+    elif saw_compaction_item and not final_text:
+        # A compaction-only output is a state checkpoint, not a user-visible
+        # final answer. Continue once with the newly compacted projection.
         finish_reason = "incomplete"
     elif (reasoning_items_raw or reasoning_parts or saw_reasoning_item) and not final_text:
         # Response contains only reasoning (encrypted thinking state and/or
