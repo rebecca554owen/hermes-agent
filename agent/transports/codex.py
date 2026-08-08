@@ -8,7 +8,10 @@ streaming, or the _run_codex_stream() call path.
 import hashlib
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from agent.responses_compaction import NativeCompactionRoute
 
 # Cron fires build session_id as ``cron_<job_id>_<YYYYMMDD_HHMMSS>`` (see
 # cron/scheduler.py). The trailing timestamp is per-fire noise; stripped so
@@ -173,6 +176,42 @@ def _content_cache_key(
     return f"pck_{digest}"
 
 
+def _extract_compaction_boundary(
+    messages: List[Dict[str, Any]],
+) -> Optional[Tuple["NativeCompactionRoute", Optional[str]]]:
+    """Locate the compaction boundary sidecar carried by a transcript.
+
+    Scans for the first assistant message with a non-empty
+    ``codex_output_items`` sidecar and validates it with the same strict
+    fence rules the adapter replay branch enforces. The returned route is
+    parsed from the sidecar's own ``_compaction_route`` stamp — never
+    reconstructed from transport params — so it is byte-identical to the
+    stamp the adapter compares against, and the digest is the canonical
+    checkpoint digest of the exact ordered items.
+
+    Malformed sidecars are skipped and None is returned, so the adapter's
+    plain transcript replay remains the fallback: a bad sidecar must never
+    break or alter a request.
+    """
+    from agent.responses_compaction import (
+        NativeCompactionStateError,
+        validate_compaction_sidecar,
+    )
+
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        items = msg.get("codex_output_items")
+        if not isinstance(items, list) or not items:
+            continue
+        try:
+            return validate_compaction_sidecar(items)
+        except (NativeCompactionStateError, TypeError, ValueError):
+            # Not a trustworthy checkpoint — fall back to plain replay.
+            continue
+    return None
+
+
 class ResponsesApiTransport(ProviderTransport):
     """Transport for api_mode='codex_responses'.
 
@@ -205,6 +244,7 @@ class ResponsesApiTransport(ProviderTransport):
         from agent.codex_responses_adapter import _chat_messages_to_responses_input
         issuer = self._resolve_issuer_kind(kwargs)
         self._last_issuer_kind = issuer
+        compaction = _extract_compaction_boundary(messages)
         return _chat_messages_to_responses_input(
             messages,
             is_xai_responses=kwargs.get("is_xai_responses") is True,
@@ -213,6 +253,13 @@ class ResponsesApiTransport(ProviderTransport):
                 kwargs.get("replay_encrypted_reasoning", True)
             ),
             current_issuer_kind=issuer,
+            current_compaction_route=(
+                compaction[0].to_dict() if compaction is not None else None
+            ),
+            expected_compaction_digest=(
+                compaction[1] if compaction is not None else None
+            ),
+            replay_native_compaction=True,
         )
 
     def convert_tools(self, tools: List[Dict[str, Any]]) -> Any:
@@ -279,6 +326,13 @@ class ResponsesApiTransport(ProviderTransport):
         # dropped before the API rejects them.
         issuer_kind = self._resolve_issuer_kind(params)
         self._last_issuer_kind = issuer_kind
+
+        # Native compaction sidecar: locate the boundary assistant message's
+        # ``codex_output_items`` and thread its route/digest to the adapter's
+        # replay branch so the provider-minted compaction checkpoint can
+        # become the new request prefix. None when the transcript carries no
+        # sidecar (or only a malformed one) — plain replay, zero regression.
+        compaction = _extract_compaction_boundary(payload_messages)
 
         # Resolve reasoning effort
         reasoning_effort = "medium"
@@ -360,6 +414,13 @@ class ResponsesApiTransport(ProviderTransport):
                 is_github_responses=is_github_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning,
                 current_issuer_kind=issuer_kind,
+                current_compaction_route=(
+                    compaction[0].to_dict() if compaction is not None else None
+                ),
+                expected_compaction_digest=(
+                    compaction[1] if compaction is not None else None
+                ),
+                replay_native_compaction=True,
             ),
             "store": False,
         }
