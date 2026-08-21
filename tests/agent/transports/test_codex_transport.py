@@ -1221,3 +1221,170 @@ class TestPreflightSlashEnumStrip:
         assert params["properties"]["model_id"].get("enum") == [
             "Qwen/Qwen3.5-0.8B", "plain-id"
         ]
+
+
+class TestCodexTransportCompactionBridge:
+    """Transport-level wiring for the native compaction sidecar (GAP-A).
+
+    The compressor (Task 4) mounts a ``codex_output_items`` sidecar on the
+    compaction boundary message; the responses adapter replay branch (Task 3)
+    only consumes it when the transport threads ``current_compaction_route`` /
+    ``expected_compaction_digest`` through. These tests pin the transport
+    wiring in convert_messages and build_kwargs, and the zero-regression
+    fallback when no sidecar (or a foreign-issuer sidecar) is present.
+    """
+
+    @staticmethod
+    def _route(issuer: str = "codex_backend"):
+        from agent.responses_compaction import NativeCompactionRoute
+        return NativeCompactionRoute(
+            issuer_kind=issuer,
+            endpoint="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.1-codex",
+        )
+
+    @staticmethod
+    def _boundary_messages(issuer: str = "codex_backend") -> list:
+        """Transcript whose boundary assistant message carries an ordered
+        compaction sidecar stamped for *issuer*."""
+        route_dict = TestCodexTransportCompactionBridge._route(issuer).to_dict()
+        return [
+            {"role": "user", "content": "old user"},
+            {"role": "assistant", "content": "old assistant"},
+            {
+                "role": "assistant",
+                "content": "boundary visible text",
+                "codex_output_items": [
+                    {
+                        "type": "compaction",
+                        "encrypted_content": "opaque-compact-state",
+                        "_issuer_kind": issuer,
+                        "_compaction_route": route_dict,
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": "boundary visible text"}
+                        ],
+                        "_issuer_kind": issuer,
+                        "_compaction_route": route_dict,
+                    },
+                ],
+            },
+            {"role": "user", "content": "new user"},
+        ]
+
+    @staticmethod
+    def _strip_sidecar(messages: list) -> list:
+        return [
+            dict(m, codex_output_items=None) if "codex_output_items" in m else m
+            for m in messages
+        ]
+
+    _CODEX_PARAMS = {
+        "is_codex_backend": True,
+        "base_url": "https://chatgpt.com/backend-api/codex",
+    }
+
+    def test_convert_messages_replays_compaction_sidecar_prefix(self, transport):
+        """A same-issuer sidecar becomes the new request prefix: the ordered
+        output items replace all earlier history (compaction item first)."""
+        items = transport.convert_messages(
+            self._boundary_messages(), **self._CODEX_PARAMS
+        )
+        assert [item.get("type") for item in items[:2]] == ["compaction", "message"]
+        assert items[0] == {
+            "type": "compaction",
+            "encrypted_content": "opaque-compact-state",
+        }
+        assert items[1]["content"][0]["text"] == "boundary visible text"
+        assert items[-1] == {"role": "user", "content": "new user"}
+        assert all(item.get("content") != "old user" for item in items)
+
+    def test_convert_messages_no_sidecar_unchanged(self, transport):
+        """No sidecar in the transcript → the projection is byte-identical to
+        the plain content replay (zero regression)."""
+        messages = self._boundary_messages()
+        plain = transport.convert_messages(
+            self._strip_sidecar(messages), **self._CODEX_PARAMS
+        )
+        assert all(item.get("type") != "compaction" for item in plain)
+        assert [item.get("content") for item in plain] == [
+            "old user",
+            "old assistant",
+            "boundary visible text",
+            "new user",
+        ]
+
+    def test_convert_messages_foreign_issuer_falls_back(self, transport):
+        """A sidecar stamped for a different issuer is not replayed — the
+        encrypted blob is only decryptable by the minting endpoint, so the
+        transport falls back to the plain content replay."""
+        items = transport.convert_messages(
+            self._boundary_messages(issuer="codex_backend"),
+            is_xai_responses=True,
+            base_url="https://api.x.ai/v1",
+        )
+        assert all(item.get("type") != "compaction" for item in items)
+        assert [item.get("content") for item in items] == [
+            "old user",
+            "old assistant",
+            "boundary visible text",
+            "new user",
+        ]
+
+    def test_build_kwargs_replays_compaction_sidecar_prefix(self, transport):
+        """build_kwargs threads the sidecar route/digest through to the input
+        converter the same way convert_messages does."""
+        kw = transport.build_kwargs(
+            model="gpt-5.1-codex",
+            messages=self._boundary_messages(),
+            tools=[],
+            **self._CODEX_PARAMS,
+        )
+        items = kw["input"]
+        assert items[0]["type"] == "compaction"
+        assert items[0]["encrypted_content"] == "opaque-compact-state"
+        assert items[-1] == {"role": "user", "content": "new user"}
+
+    def test_build_kwargs_no_sidecar_unchanged(self, transport):
+        """build_kwargs without a sidecar keeps the plain projection."""
+        messages = self._boundary_messages()
+        kw_sidecar = transport.build_kwargs(
+            model="gpt-5.1-codex",
+            messages=messages,
+            tools=[],
+            **self._CODEX_PARAMS,
+        )
+        kw_plain = transport.build_kwargs(
+            model="gpt-5.1-codex",
+            messages=self._strip_sidecar(messages),
+            tools=[],
+            **self._CODEX_PARAMS,
+        )
+        assert kw_sidecar["input"][0]["type"] == "compaction"
+        assert all(item.get("type") != "compaction" for item in kw_plain["input"])
+        assert [item.get("content") for item in kw_plain["input"]] == [
+            "old user",
+            "old assistant",
+            "boundary visible text",
+            "new user",
+        ]
+
+    def test_convert_messages_malformed_sidecar_skipped(self, transport):
+        """A sidecar with inconsistent route stamps is skipped, not fatal —
+        the request falls back to the plain transcript replay."""
+        messages = self._boundary_messages()
+        route_b = self._route(issuer="xai_responses").to_dict()
+        messages[2]["codex_output_items"][0]["_compaction_route"] = route_b
+        messages[2]["codex_output_items"][0]["_issuer_kind"] = "xai_responses"
+        items = transport.convert_messages(messages, **self._CODEX_PARAMS)
+        assert all(item.get("type") != "compaction" for item in items)
+        assert [item.get("content") for item in items] == [
+            "old user",
+            "old assistant",
+            "boundary visible text",
+            "new user",
+        ]
+

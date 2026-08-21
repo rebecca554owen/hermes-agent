@@ -8,6 +8,44 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
+@pytest.mark.parametrize(
+    ("target_model", "expected_mode"),
+    [
+        ("deepseek-v4-flash", "codex_responses"),
+        ("deepseek-v4-pro", "codex_responses"),
+    ],
+)
+def test_opencode_go_target_model_overrides_stale_persisted_api_mode(
+    monkeypatch, target_model, expected_mode
+):
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "opencode-go",
+            "default": "deepseek-v4-pro",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_api_key_provider_credentials",
+        lambda _provider: {
+            "provider": "opencode-go",
+            "api_key": "go-key",
+            "base_url": "https://opencode.ai/zen/go/v1",
+            "source": "test",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="opencode-go", target_model=target_model
+    )
+
+    assert resolved["api_mode"] == expected_mode
+    assert resolved["base_url"] == "https://opencode.ai/zen/go/v1"
+
+
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
     """A saved provider must not resolve as another authenticated provider."""
     monkeypatch.setattr(

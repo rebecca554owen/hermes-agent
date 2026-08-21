@@ -2087,6 +2087,19 @@ def init_agent(
     # 2.5%/10K-25K tail with recovery-pointer machinery (#87326). Unknown
     # values fall back to legacy inside the compressor.
     compression_tail_mode = str(_compression_cfg.get("tail_mode", "legacy")).strip().lower()
+# Native Responses compaction bridge gate (compression.remote:
+    # auto|on|off). "auto" (default) and "on" mount the wrapped local
+    # summary as a codex_output_items compaction sidecar on the boundary
+    # assistant message (consumed by the responses adapter replay branch);
+    # "off" keeps compress() byte-identical to the pre-bridge behavior.
+    # Unrecognized values fall back to auto; the ContextCompressor
+    # constructor normalizes both values defensively.
+    compression_remote = str(_compression_cfg.get("remote", "auto")).strip().lower()
+    if compression_remote not in {"auto", "on", "off"}:
+        compression_remote = "auto"
+    compression_remote_max_item_chars = _compression_cfg.get(
+        "remote_max_item_chars", 12000
+    )
     # Minimum REAL (actionable) user messages guaranteed to survive in the
     # uncompressed tail (compression.min_tail_user_messages).  Default 1
     # preserves current behavior exactly — the existing single-user tail
@@ -2718,6 +2731,8 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
+compression_remote=compression_remote,
+            compression_remote_max_item_chars=compression_remote_max_item_chars,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

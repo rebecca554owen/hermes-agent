@@ -2682,6 +2682,10 @@ class SessionTurnLeaseLostError(RuntimeError):
     """
 
 
+class CodexResponsesCompactionStateConflictError(RuntimeError):
+    """The durable route ledger changed before a checkpoint could commit."""
+
+
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
 
@@ -7935,6 +7939,187 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return dict(row) if row else None
 
+    @staticmethod
+    def _active_compaction_messages(conn, session_id: str) -> List[Dict[str, Any]]:
+        """Load decoded stored sidecar custody for coupled ledger validation."""
+        rows = conn.execute(
+            "SELECT role, codex_output_items FROM messages "
+            "WHERE session_id = ? AND active = 1 "
+            "AND codex_output_items IS NOT NULL ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        messages: List[Dict[str, Any]] = []
+        for row in rows:
+            raw_items = row["codex_output_items"]
+            try:
+                items = json.loads(raw_items) if isinstance(raw_items, str) else raw_items
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise ValueError(
+                    f"Malformed codex_output_items for session {session_id}"
+                ) from exc
+            if not isinstance(items, list):
+                raise ValueError(
+                    f"Malformed codex_output_items for session {session_id}"
+                )
+            messages.append({"role": row["role"], "codex_output_items": items})
+        return messages
+
+    def get_codex_responses_compaction_state(
+        self, session_id: str
+    ) -> Dict[str, Any]:
+        """Return the strictly validated coupled ledger/transcript state."""
+        from agent.responses_compaction import (
+            NativeCompactionLedger,
+            validate_compaction_lifecycle,
+        )
+
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT codex_responses_compaction_state FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            messages = (
+                self._active_compaction_messages(conn, session_id) if row else []
+            )
+        if not row:
+            return NativeCompactionLedger.empty().to_dict()
+        raw = row["codex_responses_compaction_state"]
+        if not raw:
+            for message in messages:
+                items = message.get("codex_output_items")
+                if not isinstance(items, list):
+                    continue
+                if any(
+                    isinstance(item, dict)
+                    and item.get("type") == "compaction"
+                    for item in items
+                ):
+                    raise ValueError(
+                        "Missing codex_responses_compaction_state for "
+                        "transcript containing compaction sidecars"
+                    )
+            return NativeCompactionLedger.empty().to_dict()
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(
+                f"Malformed codex_responses_compaction_state for {session_id}"
+            ) from exc
+        ledger = NativeCompactionLedger.from_dict(value)
+        return validate_compaction_lifecycle(ledger, messages).to_dict()
+
+    def compare_and_set_codex_responses_compaction_state(
+        self,
+        session_id: str,
+        *,
+        expected_revision: int,
+        state: Dict[str, Any],
+    ) -> bool:
+        """Atomically persist a strictly validated v3 route ledger revision.
+
+        Returns ``False`` when another writer already advanced the state.
+        """
+        from agent.responses_compaction import (
+            NativeCompactionLedger,
+            _merge_policy,
+            validate_compaction_lifecycle,
+        )
+
+        if (
+            not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 0
+        ):
+            raise ValueError("expected_revision must be a non-negative integer")
+        expected = expected_revision
+        candidate = NativeCompactionLedger.from_dict(state)
+        if candidate.revision != expected:
+            raise ValueError("candidate ledger revision must equal expected_revision")
+        payload = candidate.to_dict()
+        payload["revision"] = expected + 1
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT codex_responses_compaction_state FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if not row:
+                return False
+            current_revision = 0
+            current = NativeCompactionLedger.empty()
+            raw = row["codex_responses_compaction_state"]
+            if raw:
+                current = NativeCompactionLedger.from_dict(json.loads(raw))
+                current_revision = current.revision
+            messages = self._active_compaction_messages(conn, session_id)
+            validate_compaction_lifecycle(current, messages)
+            if current_revision != expected:
+                return False
+
+            current_keys = set(current.routes)
+            candidate_keys = set(candidate.routes)
+            added_keys = candidate_keys - current_keys
+            removed_keys = current_keys - candidate_keys
+            modified_keys = {
+                route_key
+                for route_key in current_keys & candidate_keys
+                if candidate.routes[route_key].to_ledger_entry()
+                != current.routes[route_key].to_ledger_entry()
+            }
+            if len(added_keys) > 1 or len(modified_keys) > 1 or (
+                added_keys and modified_keys
+            ):
+                raise ValueError("compaction ledger CAS may merge only one route")
+
+            changed_keys = added_keys or modified_keys
+            if changed_keys:
+                changed_key = next(iter(changed_keys))
+                desired_policy = candidate.routes[changed_key]
+                merged_policy = _merge_policy(
+                    current.policy_for(desired_policy.route), desired_policy
+                )
+                if (
+                    merged_policy.to_ledger_entry()
+                    != desired_policy.to_ledger_entry()
+                ):
+                    raise ValueError(
+                        "compaction ledger CAS route transition is not monotonic"
+                    )
+                expected_keys = set(current.with_policy(desired_policy).routes)
+                if candidate_keys != expected_keys:
+                    raise ValueError(
+                        "compaction ledger CAS cannot drop unrelated routes"
+                    )
+            elif removed_keys:
+                raise ValueError(
+                    "compaction ledger CAS cannot drop unrelated routes"
+                )
+
+            for route_key, candidate_policy in candidate.routes.items():
+                current_policy = current.routes.get(route_key)
+                current_count = (
+                    current_policy.compaction_count if current_policy else 0
+                )
+                current_digest = (
+                    current_policy.last_compaction_digest if current_policy else None
+                )
+                if (
+                    candidate_policy.compaction_count != current_count
+                    or candidate_policy.last_compaction_digest != current_digest
+                ):
+                    raise ValueError(
+                        "compaction checkpoint changes require atomic message append"
+                    )
+            validate_compaction_lifecycle(candidate, messages)
+            conn.execute(
+                "UPDATE sessions SET codex_responses_compaction_state = ? WHERE id = ?",
+                (encoded, session_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
@@ -9170,6 +9355,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the two writers can never diverge on these correctness invariants
         (this guard has already needed targeted fixes — see the #74478
         patience note below).
+
+        Returns the loaded ``sessions`` row (including the native compaction
+        ledger column) for callers that need it.
         """
         # NOTE (#75316 redesign): appends do NOT check compression_locks.
         # The lock's job is to stop two COMPRESSIONS colliding, not to fence
@@ -9209,7 +9397,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     ),
                 )
         session = conn.execute(
-            "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+            "SELECT ended_at, end_reason, codex_responses_compaction_state "
+            "FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
         if (
@@ -9218,6 +9407,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             and session["end_reason"] == "compression"
         ):
             raise CompressionSessionClosedError(session_id)
+        return session
 
     @staticmethod
     def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
@@ -9279,6 +9469,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
+        codex_output_items: Any = None,
         platform_message_id: str = None,
         observed: bool = False,
         effect_disposition: Optional[str] = None,
@@ -9289,6 +9480,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
+codex_responses_compaction_policy: Optional[Dict[str, Any]] = None,
+        expected_codex_responses_compaction_revision: Optional[int] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -9310,6 +9503,55 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         from every outgoing payload anyway, so the scrubbed form IS the
         wire bytes).
         """
+        if (codex_responses_compaction_policy is None) != (
+            expected_codex_responses_compaction_revision is None
+        ):
+            raise ValueError(
+                "checkpoint policy and expected compaction revision must be provided together"
+            )
+        checkpoint_policy = None
+        checkpoint_expected_revision = None
+        if codex_output_items is not None:
+            from agent.responses_compaction import (
+                validate_compaction_message_sidecar,
+            )
+
+            validated_sidecar = validate_compaction_message_sidecar(
+                {"role": role, "codex_output_items": codex_output_items}
+            )
+            assert validated_sidecar is not None
+            codex_output_items = validated_sidecar[0]
+        if codex_responses_compaction_policy is not None:
+            from agent.responses_compaction import (
+                NativeCompactionPolicy,
+                has_replayable_compaction_sidecar,
+            )
+
+            checkpoint_policy = NativeCompactionPolicy.from_dict(
+                codex_responses_compaction_policy
+            )
+            checkpoint_expected_revision = expected_codex_responses_compaction_revision
+            if (
+                not isinstance(checkpoint_expected_revision, int)
+                or isinstance(checkpoint_expected_revision, bool)
+                or checkpoint_expected_revision < 0
+            ):
+                raise ValueError(
+                    "expected compaction revision must be a non-negative integer"
+                )
+            if checkpoint_policy.revision != checkpoint_expected_revision:
+                raise ValueError(
+                    "checkpoint policy revision must equal expected compaction revision"
+                )
+            if not has_replayable_compaction_sidecar(
+                [{"role": role, "codex_output_items": codex_output_items}],
+                route=checkpoint_policy.route,
+                expected_digest=checkpoint_policy.last_compaction_digest,
+            ):
+                raise ValueError(
+                    "checkpoint policy must match the assistant ordered compaction sidecar"
+                )
+
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
         display_metadata_json = self._encode_display_metadata(display_metadata)
@@ -9317,6 +9559,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reasoning_details_json = self._reasoning_json_text(reasoning_details)
         codex_items_json = self._reasoning_json_text(codex_reasoning_items)
         codex_message_items_json = self._reasoning_json_text(codex_message_items)
+        codex_output_items_json = self._reasoning_json_text(codex_output_items)
         # tool_calls may arrive as a Python list (from the live agent) or
         # as a JSON string (from import/export). Parse first to avoid
         # double-encoding.
@@ -9346,19 +9589,83 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
         def _do(conn):
-            self._check_transcript_write_guards(
+            session = self._check_transcript_write_guards(
                 conn,
                 session_id,
                 compression_lock_holder,
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
+            checkpoint_encoded = None
+            if checkpoint_policy is not None:
+                if session is None:
+                    raise ValueError(
+                        "native compaction checkpoint session does not exist"
+                    )
+                from agent.responses_compaction import (
+                    NativeCompactionLedger,
+                    _merge_policy,
+                    validate_compaction_lifecycle,
+                )
+
+                raw_ledger = session["codex_responses_compaction_state"]
+                if raw_ledger:
+                    ledger = NativeCompactionLedger.from_dict(
+                        json.loads(raw_ledger)
+                    )
+                else:
+                    ledger = NativeCompactionLedger.empty()
+                existing_compaction_messages = self._active_compaction_messages(
+                    conn, session_id
+                )
+                validate_compaction_lifecycle(
+                    ledger, existing_compaction_messages
+                )
+                if ledger.revision != checkpoint_expected_revision:
+                    raise CodexResponsesCompactionStateConflictError(
+                        "native compaction checkpoint revision changed"
+                    )
+                current_policy = ledger.policy_for(checkpoint_policy.route)
+                if (
+                    checkpoint_policy.last_compaction_digest
+                    == current_policy.last_compaction_digest
+                ):
+                    expected_compaction_count = current_policy.compaction_count
+                else:
+                    expected_compaction_count = current_policy.compaction_count + 1
+                if (
+                    checkpoint_policy.compaction_count
+                    != expected_compaction_count
+                ):
+                    raise ValueError(
+                        "native compaction checkpoint counter is inconsistent "
+                        "with its committed digest"
+                    )
+                merged_policy = _merge_policy(
+                    current_policy, checkpoint_policy
+                )
+                next_ledger = ledger.with_policy(merged_policy).to_dict()
+                next_ledger["revision"] = ledger.revision + 1
+                committed_ledger = NativeCompactionLedger.from_dict(next_ledger)
+                validate_compaction_lifecycle(
+                    committed_ledger,
+                    existing_compaction_messages
+                    + [
+                        {
+                            "role": role,
+                            "codex_output_items": codex_output_items,
+                        }
+                    ],
+                )
+                checkpoint_encoded = json.dumps(
+                    next_ledger, sort_keys=True, separators=(",", ":")
+                )
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, codex_output_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -9375,6 +9682,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    codex_output_items_json,
                     platform_message_id,
                     1 if observed else 0,
                     1,
@@ -9396,6 +9704,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute(
                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                     (session_id,),
+                )
+            if checkpoint_encoded is not None:
+                # This update and the message INSERT share the same
+                # _execute_write transaction. Any trigger, I/O failure, or
+                # conflict rolls both back, so capability can never outrun its
+                # durable opaque checkpoint.
+                conn.execute(
+                    "UPDATE sessions SET codex_responses_compaction_state = ? "
+                    "WHERE id = ?",
+                    (checkpoint_encoded, session_id),
                 )
             return msg_id
 
@@ -9763,9 +10081,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             codex_message_items = (
                 msg.get("codex_message_items") if role == "assistant" else None
             )
+            codex_output_items = msg.get("codex_output_items")
+            if codex_output_items is not None:
+                from agent.responses_compaction import (
+                    validate_compaction_message_sidecar,
+                )
+
+                validated_sidecar = validate_compaction_message_sidecar(msg)
+                assert validated_sidecar is not None
+                codex_output_items = validated_sidecar[0]
             reasoning_details_json = self._reasoning_json_text(reasoning_details)
             codex_items_json = self._reasoning_json_text(codex_reasoning_items)
             codex_message_items_json = self._reasoning_json_text(codex_message_items)
+            codex_output_items_json = self._reasoning_json_text(codex_output_items)
             # tool_calls may arrive as a Python list (from the live agent)
             # or as a JSON string (from import_sessions / export_session,
             # which store it as TEXT). json.dumps on an already-serialized
@@ -9788,8 +10116,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, codex_output_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -9806,6 +10134,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    codex_output_items_json,
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
                     1,
@@ -10526,7 +10855,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _CONVERSATION_ROW_COLUMNS = (
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
-        "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
+        "codex_reasoning_items, codex_message_items, codex_output_items, platform_message_id, observed, timestamp, "
         "api_content, display_kind, display_metadata"
     )
 
@@ -10625,6 +10954,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Failed to deserialize codex_message_items, falling back to None")
                         msg["codex_message_items"] = None
+            if row["codex_output_items"] is not None:
+                from agent.responses_compaction import (
+                    validate_compaction_message_sidecar,
+                )
+
+                validated_sidecar = validate_compaction_message_sidecar(
+                    {
+                        "role": row["role"],
+                        "codex_output_items": row["codex_output_items"],
+                    }
+                )
+                assert validated_sidecar is not None
+                msg["codex_output_items"] = validated_sidecar[0]
             if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
                 continue
             messages.append(msg)

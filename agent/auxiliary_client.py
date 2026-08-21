@@ -440,6 +440,44 @@ def _aux_progress_active() -> bool:
     return getattr(_aux_progress, "hook", None) is not None
 
 
+def _anthropic_event_has_content(event: Any) -> bool:
+    event_type = getattr(event, "type", None)
+    if event_type == "content_block_delta":
+        delta = getattr(event, "delta", None)
+        if delta:
+            if getattr(delta, "text", None) or getattr(delta, "thinking", None) or getattr(delta, "partial_json", None):
+                return True
+    return False
+
+
+def _codex_event_has_content(event: Any) -> bool:
+    event_type = getattr(event, "type", None)
+    if event_type in (
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.text.delta",
+        "response.audio.delta",
+        "response.function_call_arguments.delta",
+        "response.reasoning_text.delta",
+    ):
+        return True
+    if isinstance(event, dict):
+        ev_type = event.get("type")
+        if ev_type in (
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.text.delta",
+            "response.audio.delta",
+            "response.function_call_arguments.delta",
+            "response.reasoning_text.delta",
+        ):
+            return True
+        delta = event.get("delta")
+        if delta and (delta.get("text") or delta.get("reasoning")):
+            return True
+    return False
+
+
 @contextlib.contextmanager
 def aux_progress_hook(hook):
     """Install *hook* as the current thread's aux forward-progress callback.
@@ -1780,10 +1818,9 @@ class _CodexCompletionsAdapter:
             def _on_each_event(_event: Any) -> None:
                 # Re-check timeout/cancellation per event, matching the
                 # cadence the old in-line ``_check_cancelled()`` used.
-                # Each SSE event is also forward progress for hosts watching
-                # a progress hook (gateway session hygiene): a reasoning
-                # model streaming a long summary must not look hung.
-                _notify_aux_progress()
+                # Only tick progress when the SSE event carries text/content.
+                if _codex_event_has_content(_event):
+                    _notify_aux_progress()
                 _check_cancelled()
 
             event_stream = self._client.responses.create(**stream_kwargs)
@@ -2142,7 +2179,7 @@ class _AnthropicCompletionsAdapter:
             # slow-but-generating summary model. No-op when no hook is
             # installed (None keeps the fast get_final_message path).
             on_stream_event=(
-                (lambda _event: _notify_aux_progress())
+                (lambda _event: _notify_aux_progress() if _anthropic_event_has_content(_event) else None)
                 if _aux_progress_active() else None
             ),
         )
@@ -6803,15 +6840,21 @@ def resolve_provider_client(
                          provider, ", ".join(tried_sources))
             return None, None
 
-        base_url = _to_openai_base_url(raw_base_url)
-        # Honour an explicit base_url override from the caller — used when a
-        # fallback_model entry (or custom_providers lookup) routes through a
-        # built-in provider name but targets a user-specified endpoint.
-        if explicit_base_url:
-            base_url = _to_openai_base_url(explicit_base_url.strip().rstrip("/"))
-
         default_model = _get_aux_model_for_provider(provider)
         final_model = _normalize_resolved_model(model or default_model, provider)
+
+        if provider in {"opencode-zen", "opencode-go"}:
+            from hermes_cli.models import (
+                normalize_opencode_base_url,
+                opencode_model_api_mode,
+            )
+
+            api_mode = opencode_model_api_mode(provider, final_model)
+            raw_base_url = normalize_opencode_base_url(
+                provider, api_mode, raw_base_url
+            )
+
+        base_url = _to_openai_base_url(raw_base_url)
 
         if provider == "gemini":
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
@@ -9071,7 +9114,7 @@ class _ChatStreamAccumulator:
         self.resp_model = model or ""
 
     def feed(self, chunk: Any) -> None:
-        _notify_aux_progress()
+        _made_progress = False
         if (
             self._total_ceiling is not None
             and (time.monotonic() - self._started) >= self._total_ceiling
@@ -9085,6 +9128,9 @@ class _ChatStreamAccumulator:
         chunk_usage = getattr(chunk, "usage", None)
         if chunk_usage:
             self.usage = chunk_usage
+            # Usage is a billing trailer, not a token delta — do not count it
+            # as forward progress; only real content/reasoning/tool-call deltas
+            # should advance CompressionCommitFence._last_progress.
         choices = getattr(chunk, "choices", None) or []
         if not choices:
             return
@@ -9096,13 +9142,16 @@ class _ChatStreamAccumulator:
         piece = getattr(delta, "content", None)
         if piece:
             self.content_parts.append(piece)
+            _made_progress = True
         reasoning_piece = (
             getattr(delta, "reasoning", None)
             or getattr(delta, "reasoning_content", None)
         )
         if reasoning_piece and isinstance(reasoning_piece, str):
             self.reasoning_parts.append(reasoning_piece)
+            _made_progress = True
         for tc in (getattr(delta, "tool_calls", None) or []):
+            _made_progress = True
             idx = getattr(tc, "index", 0) or 0
             acc = self.tool_calls_acc.setdefault(
                 idx, {"id": "", "name": "", "arguments": []}
@@ -9115,6 +9164,9 @@ class _ChatStreamAccumulator:
                     acc["name"] = fn.name
                 if getattr(fn, "arguments", None):
                     acc["arguments"].append(fn.arguments)
+        
+        if _made_progress:
+            _notify_aux_progress()
 
     def finish(self) -> Any:
         tool_calls = None

@@ -243,6 +243,35 @@ the request without it. Switching the session to a non-eligible model or route
 simply stops the field from being sent — captured checkpoints are dropped from
 replay by the existing cross-issuer guard when the endpoint changes.
 
+### Remote compaction bridge (Responses API routes)
+
+> **Local fork feature** — not part of upstream Hermes.
+
+On `codex_responses` routes (e.g. DeepSeek V4 Flash via OpenCode Go, which
+serves the Responses API), the local summarizer output can additionally be
+delivered to the provider as a `type:"compaction"` input item — the provider
+protocol's native carry-forward of prior context. Providers without native
+compaction semantics (measured: OpenCode Go ignores the item entirely, 0
+additional input tokens, and the item prefix still hits the prompt cache)
+accept the shape but never produce compaction items of their own, so this is a
+*one-way bridge*: the local summary is what actually shrinks the request, and
+the compaction item is a protocol-conformant placeholder prefix.
+
+Control via `compression.remote`:
+
+| value | behavior |
+|---|---|
+| `auto` (default) | Probe upstream capability per route. `shape_accepted` → bridge delivery; `item_observed` (future upstreams that return native compaction items) → consume the upstream item and skip local summary generation. |
+| `on` | Force bridge delivery; fall back to local-only compression when the upstream rejects the compaction shape. |
+| `off` | Disable compaction delivery entirely — identical to the pre-bridge local summary replacement. |
+
+`compression.remote_max_item_chars` caps the envelope size (default 12000);
+oversized summaries are truncated preserving the envelope header and summary
+tail.
+
+Note: `compression.remote` is read at agent startup (like the rest of this
+section) — a process restart is required after changing it.
+
 ### Computed Values (for a 200K context model at defaults)
 
 ```
